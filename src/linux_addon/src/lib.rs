@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use engine::out::OutBuf;
 
 // ---------------------------------------------------------------- Linux x86_64 raw syscalls
 
@@ -21,7 +21,9 @@ const SYS_OPENAT: usize = 257;
 const AT_FDCWD: usize = (-100isize) as usize;
 const O_RDONLY: usize = 0;
 const O_WRONLY_CREAT_TRUNC: usize = 1 | 64 | 512; // 01101 = 577
+const PROT_READ: usize = 1;
 const PROT_READ_WRITE: usize = 3;
+const MAP_PRIVATE: usize = 0x02;
 const MAP_PRIVATE_ANON: usize = 0x22;
 
 #[inline(always)]
@@ -31,6 +33,22 @@ unsafe fn syscall1(n: usize, a1: usize) -> isize {
         "syscall",
         in("rax") n,
         in("rdi") a1,
+        out("rcx") _,
+        out("r11") _,
+        lateout("rax") ret,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> isize {
+    let ret: isize;
+    asm!(
+        "syscall",
+        in("rax") n,
+        in("rdi") a1,
+        in("rsi") a2,
         out("rcx") _,
         out("r11") _,
         lateout("rax") ret,
@@ -97,7 +115,6 @@ unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usi
 #[inline(always)]
 fn sys_exit_group(code: i32) -> ! {
     unsafe {
-        let _: isize;
         asm!(
             "syscall",
             in("rax") SYS_EXIT_GROUP,
@@ -107,7 +124,7 @@ fn sys_exit_group(code: i32) -> ! {
     }
 }
 
-// ---------------------------------------------------------------- Freestanding Allocator (.bss Arena + mmap fallback)
+// ---------------------------------------------------------------- Single-Threaded .bss Arena + Case Reset
 
 const ARENA_SIZE: usize = 128 * 1024 * 1024; // 128 MiB demand-paged .bss (0B on disk)
 
@@ -115,7 +132,18 @@ const ARENA_SIZE: usize = 128 * 1024 * 1024; // 128 MiB demand-paged .bss (0B on
 struct Arena([u8; ARENA_SIZE]);
 
 static mut ARENA: Arena = Arena([0u8; ARENA_SIZE]);
-static ARENA_OFF: AtomicUsize = AtomicUsize::new(0);
+static mut ARENA_OFF: usize = 0;
+static mut OUT_BUF: [u8; 262144] = [0u8; 262144];
+
+#[inline(always)]
+unsafe fn arena_mark() -> usize {
+    ARENA_OFF
+}
+
+#[inline(always)]
+unsafe fn arena_reset(mark: usize) {
+    ARENA_OFF = mark;
+}
 
 struct ArenaAlloc;
 
@@ -123,32 +151,34 @@ struct ArenaAlloc;
 static ALLOCATOR: ArenaAlloc = ArenaAlloc;
 
 unsafe impl GlobalAlloc for ArenaAlloc {
-    #[inline]
+    #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align().max(8);
         let size = layout.size();
-        let mut cur = ARENA_OFF.load(Ordering::Relaxed);
-        loop {
-            let aligned = (cur + align - 1) & !(align - 1);
-            let next = aligned.saturating_add(size);
-            if next <= ARENA_SIZE {
-                match ARENA_OFF.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => return (&raw mut ARENA.0 as *mut u8).add(aligned),
-                    Err(v) => cur = v,
-                }
-            } else {
-                // Overflow fallback via mmap
-                let req = (size + 4095) & !4095;
-                let ptr = syscall6(SYS_MMAP, 0, req.max(4096), PROT_READ_WRITE, MAP_PRIVATE_ANON, (-1isize) as usize, 0);
-                if ptr < 0 {
-                    return core::ptr::null_mut();
-                }
-                return ptr as *mut u8;
-            }
+        let aligned = (ARENA_OFF + align - 1) & !(align - 1);
+        let next = aligned.saturating_add(size);
+        if next <= ARENA_SIZE {
+            ARENA_OFF = next;
+            return (&raw mut ARENA.0 as *mut u8).add(aligned);
         }
+        let req = (size + 4095) & !4095;
+        let ptr = syscall6(
+            SYS_MMAP,
+            0,
+            req.max(4096),
+            PROT_READ_WRITE,
+            MAP_PRIVATE_ANON,
+            (-1isize) as usize,
+            0,
+        );
+        let p_u = ptr as usize;
+        if p_u == 0 || p_u > (-4096isize as usize) {
+            return core::ptr::null_mut();
+        }
+        ptr as *mut u8
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 
     #[inline]
@@ -158,17 +188,16 @@ unsafe impl GlobalAlloc for ArenaAlloc {
         let p_addr = ptr as usize;
         if p_addr >= base_addr && p_addr < base_addr + ARENA_SIZE {
             let off = p_addr - base_addr;
-            let cur = ARENA_OFF.load(Ordering::Relaxed);
-            // Fast in-place tail resize when shrinking/growing the top allocation!
-            if off + layout.size() == cur && off + new_size <= ARENA_SIZE {
-                ARENA_OFF.store(off + new_size, Ordering::Relaxed);
+            if off + layout.size() == ARENA_OFF && off + new_size <= ARENA_SIZE {
+                ARENA_OFF = off + new_size;
                 return ptr;
             }
         }
         let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
         let new_ptr = self.alloc(new_layout);
         if !new_ptr.is_null() {
-            core::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
+            let copy_len = layout.size().min(new_size);
+            memcpy(new_ptr, ptr, copy_len);
         }
         new_ptr
     }
@@ -179,22 +208,70 @@ fn panic(_info: &PanicInfo) -> ! {
     sys_exit_group(1);
 }
 
-// ---------------------------------------------------------------- Custom C memory intrinsics (no libc)
+// ---------------------------------------------------------------- Vectorized C memory intrinsics (no libc)
 
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut d = dst;
-    let mut s = src;
-    let mut rem = n;
-    asm!(
-        "cld",
-        "rep movsb",
-        inout("rdi") d,
-        inout("rsi") s,
-        inout("rcx") rem,
-        options(nostack, preserves_flags)
-    );
-    let _ = (d, s, rem);
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+    if n <= 16 {
+        if n >= 8 {
+            let a = (src as *const u64).read_unaligned();
+            let b = (src.add(n - 8) as *const u64).read_unaligned();
+            (dst as *mut u64).write_unaligned(a);
+            (dst.add(n - 8) as *mut u64).write_unaligned(b);
+        } else if n >= 4 {
+            let a = (src as *const u32).read_unaligned();
+            let b = (src.add(n - 4) as *const u32).read_unaligned();
+            (dst as *mut u32).write_unaligned(a);
+            (dst.add(n - 4) as *mut u32).write_unaligned(b);
+        } else if n >= 2 {
+            let a = (src as *const u16).read_unaligned();
+            let b = (src.add(n - 2) as *const u16).read_unaligned();
+            (dst as *mut u16).write_unaligned(a);
+            (dst.add(n - 2) as *mut u16).write_unaligned(b);
+        } else if n == 1 {
+            core::ptr::write_volatile(dst, *src);
+        }
+        return dst;
+    }
+    if n <= 32 {
+        let a = _mm_loadu_si128(src as *const __m128i);
+        let b = _mm_loadu_si128(src.add(n - 16) as *const __m128i);
+        _mm_storeu_si128(dst as *mut __m128i, a);
+        _mm_storeu_si128(dst.add(n - 16) as *mut __m128i, b);
+        return dst;
+    }
+    if n <= 64 {
+        let v0 = _mm_loadu_si128(src as *const __m128i);
+        let v1 = _mm_loadu_si128(src.add(16) as *const __m128i);
+        let v2 = _mm_loadu_si128(src.add(n - 32) as *const __m128i);
+        let v3 = _mm_loadu_si128(src.add(n - 16) as *const __m128i);
+        _mm_storeu_si128(dst as *mut __m128i, v0);
+        _mm_storeu_si128(dst.add(16) as *mut __m128i, v1);
+        _mm_storeu_si128(dst.add(n - 32) as *mut __m128i, v2);
+        _mm_storeu_si128(dst.add(n - 16) as *mut __m128i, v3);
+        return dst;
+    }
+    let t0 = _mm_loadu_si128(src.add(n - 64) as *const __m128i);
+    let t1 = _mm_loadu_si128(src.add(n - 48) as *const __m128i);
+    let t2 = _mm_loadu_si128(src.add(n - 32) as *const __m128i);
+    let t3 = _mm_loadu_si128(src.add(n - 16) as *const __m128i);
+    let mut off = 0usize;
+    while off + 64 < n {
+        let v0 = _mm_loadu_si128(src.add(off) as *const __m128i);
+        let v1 = _mm_loadu_si128(src.add(off + 16) as *const __m128i);
+        let v2 = _mm_loadu_si128(src.add(off + 32) as *const __m128i);
+        let v3 = _mm_loadu_si128(src.add(off + 48) as *const __m128i);
+        _mm_storeu_si128(dst.add(off) as *mut __m128i, v0);
+        _mm_storeu_si128(dst.add(off + 16) as *mut __m128i, v1);
+        _mm_storeu_si128(dst.add(off + 32) as *mut __m128i, v2);
+        _mm_storeu_si128(dst.add(off + 48) as *mut __m128i, v3);
+        off += 64;
+    }
+    _mm_storeu_si128(dst.add(n - 64) as *mut __m128i, t0);
+    _mm_storeu_si128(dst.add(n - 48) as *mut __m128i, t1);
+    _mm_storeu_si128(dst.add(n - 32) as *mut __m128i, t2);
+    _mm_storeu_si128(dst.add(n - 16) as *mut __m128i, t3);
     dst
 }
 
@@ -203,43 +280,98 @@ pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut
     if (dst as usize) <= (src as usize) || (dst as usize) >= (src as usize).wrapping_add(n) {
         return memcpy(dst, src, n);
     }
-    if n > 0 {
-        let mut d = dst.add(n - 1);
-        let mut s = src.add(n - 1);
-        let mut rem = n;
-        asm!(
-            "std",
-            "rep movsb",
-            "cld",
-            inout("rdi") d,
-            inout("rsi") s,
-            inout("rcx") rem,
-            options(nostack)
-        );
-        let _ = (d, s, rem);
+    if n <= 64 {
+        return memcpy(dst, src, n);
     }
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+    let h0 = _mm_loadu_si128(src as *const __m128i);
+    let h1 = _mm_loadu_si128(src.add(16) as *const __m128i);
+    let h2 = _mm_loadu_si128(src.add(32) as *const __m128i);
+    let h3 = _mm_loadu_si128(src.add(48) as *const __m128i);
+    let mut off = n;
+    while off > 64 {
+        off -= 64;
+        let v0 = _mm_loadu_si128(src.add(off) as *const __m128i);
+        let v1 = _mm_loadu_si128(src.add(off + 16) as *const __m128i);
+        let v2 = _mm_loadu_si128(src.add(off + 32) as *const __m128i);
+        let v3 = _mm_loadu_si128(src.add(off + 48) as *const __m128i);
+        _mm_storeu_si128(dst.add(off) as *mut __m128i, v0);
+        _mm_storeu_si128(dst.add(off + 16) as *mut __m128i, v1);
+        _mm_storeu_si128(dst.add(off + 32) as *mut __m128i, v2);
+        _mm_storeu_si128(dst.add(off + 48) as *mut __m128i, v3);
+    }
+    _mm_storeu_si128(dst as *mut __m128i, h0);
+    _mm_storeu_si128(dst.add(16) as *mut __m128i, h1);
+    _mm_storeu_si128(dst.add(32) as *mut __m128i, h2);
+    _mm_storeu_si128(dst.add(48) as *mut __m128i, h3);
     dst
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memset(dst: *mut u8, val: i32, n: usize) -> *mut u8 {
-    let mut d = dst;
-    let mut rem = n;
-    asm!(
-        "cld",
-        "rep stosb",
-        inout("rdi") d,
-        in("al") val as u8,
-        inout("rcx") rem,
-        options(nostack, preserves_flags)
-    );
-    let _ = (d, rem);
+    use core::arch::x86_64::{_mm_set1_epi8, _mm_storeu_si128, __m128i};
+    let b = val as u8;
+    let w = (b as u64).wrapping_mul(0x0101_0101_0101_0101);
+    if n <= 16 {
+        if n >= 8 {
+            (dst as *mut u64).write_unaligned(w);
+            (dst.add(n - 8) as *mut u64).write_unaligned(w);
+        } else if n >= 4 {
+            let w4 = w as u32;
+            (dst as *mut u32).write_unaligned(w4);
+            (dst.add(n - 4) as *mut u32).write_unaligned(w4);
+        } else if n >= 2 {
+            let w2 = w as u16;
+            (dst as *mut u16).write_unaligned(w2);
+            (dst.add(n - 2) as *mut u16).write_unaligned(w2);
+        } else if n == 1 {
+            core::ptr::write_volatile(dst, b);
+        }
+        return dst;
+    }
+    let v = _mm_set1_epi8(b as i8);
+    if n <= 32 {
+        _mm_storeu_si128(dst as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(n - 16) as *mut __m128i, v);
+        return dst;
+    }
+    if n <= 64 {
+        _mm_storeu_si128(dst as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(16) as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(n - 32) as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(n - 16) as *mut __m128i, v);
+        return dst;
+    }
+    let mut off = 0usize;
+    while off + 64 < n {
+        _mm_storeu_si128(dst.add(off) as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(off + 16) as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(off + 32) as *mut __m128i, v);
+        _mm_storeu_si128(dst.add(off + 48) as *mut __m128i, v);
+        off += 64;
+    }
+    _mm_storeu_si128(dst.add(n - 64) as *mut __m128i, v);
+    _mm_storeu_si128(dst.add(n - 48) as *mut __m128i, v);
+    _mm_storeu_si128(dst.add(n - 32) as *mut __m128i, v);
+    _mm_storeu_si128(dst.add(n - 16) as *mut __m128i, v);
     dst
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, __m128i};
     let mut i = 0usize;
+    while i + 16 <= n {
+        let ca = _mm_loadu_si128(a.add(i) as *const __m128i);
+        let cb = _mm_loadu_si128(b.add(i) as *const __m128i);
+        let eq = _mm_cmpeq_epi8(ca, cb);
+        let m = _mm_movemask_epi8(eq) as u32;
+        if m != 0xFFFF {
+            let tz = (!m).trailing_zeros() as usize;
+            return (*a.add(i + tz) as i32) - (*b.add(i + tz) as i32);
+        }
+        i += 16;
+    }
     while i < n {
         let va = core::ptr::read_volatile(a.add(i));
         let vb = core::ptr::read_volatile(b.add(i));
@@ -259,15 +391,7 @@ pub unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 // ---------------------------------------------------------------- Raw I/O Helpers & Entrypoint
 
 unsafe fn read_all_fd(fd: usize) -> Option<Vec<u8>> {
-    let mut st = [0u8; 144];
-    let rc = syscall1_2_fstat(fd, st.as_mut_ptr());
-    let cap = if rc >= 0 {
-        let sz = i64::from_le_bytes(st[48..56].try_into().unwrap());
-        if sz > 0 { sz as usize + 65536 } else { 65536 }
-    } else {
-        65536
-    };
-    let mut buf: Vec<u8> = Vec::with_capacity(cap);
+    let mut buf: Vec<u8> = Vec::with_capacity(65536);
     loop {
         let len = buf.len();
         if buf.capacity() - len < 65536 {
@@ -286,22 +410,6 @@ unsafe fn read_all_fd(fd: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-#[inline(always)]
-unsafe fn syscall1_2_fstat(fd: usize, buf: *mut u8) -> isize {
-    let ret: isize;
-    asm!(
-        "syscall",
-        in("rax") SYS_FSTAT,
-        in("rdi") fd,
-        in("rsi") buf as usize,
-        out("rcx") _,
-        out("r11") _,
-        lateout("rax") ret,
-        options(nostack)
-    );
-    ret
-}
-
 unsafe fn write_all_fd(fd: usize, data: &[u8]) -> bool {
     let mut off = 0usize;
     while off < data.len() {
@@ -314,26 +422,47 @@ unsafe fn write_all_fd(fd: usize, data: &[u8]) -> bool {
     true
 }
 
-unsafe fn find_env_paths(in_path: &mut Vec<u8>, out_path: &mut Vec<u8>) {
+/// Stack-only `/proc/self/environ` reader so zero arena memory is allocated before `arena_mark`.
+unsafe fn find_env_paths(
+    in_buf: &mut [u8; 512],
+    in_len: &mut usize,
+    out_buf: &mut [u8; 512],
+    out_len: &mut usize,
+) {
     let fd = syscall4(SYS_OPENAT, AT_FDCWD, b"/proc/self/environ\0".as_ptr() as usize, O_RDONLY, 0);
     if fd < 0 {
         return;
     }
-    let env_opt = read_all_fd(fd as usize);
+    let mut env_stack = [0u8; 16384];
+    let mut total = 0usize;
+    while total < env_stack.len() {
+        let n = syscall3(
+            SYS_READ,
+            fd as usize,
+            env_stack.as_mut_ptr().add(total) as usize,
+            env_stack.len() - total,
+        );
+        if n <= 0 {
+            break;
+        }
+        total += n as usize;
+    }
     syscall1(SYS_CLOSE, fd as usize);
-    let Some(env_bytes) = env_opt else { return };
-    for item in env_bytes.split(|&b| b == 0) {
+
+    for item in env_stack[..total].split(|&b| b == 0) {
         if let Some(v) = item.strip_prefix(b"MAKEFUN_INPUT_DIR=") {
-            if !v.is_empty() {
-                in_path.clear();
-                in_path.extend_from_slice(v);
-                in_path.extend_from_slice(b"/cases.json\0");
+            if !v.is_empty() && v.len() + 12 <= in_buf.len() {
+                core::ptr::copy_nonoverlapping(v.as_ptr(), in_buf.as_mut_ptr(), v.len());
+                let suffix = b"/cases.json\0";
+                core::ptr::copy_nonoverlapping(suffix.as_ptr(), in_buf.as_mut_ptr().add(v.len()), suffix.len());
+                *in_len = v.len() + suffix.len();
             }
         } else if let Some(v) = item.strip_prefix(b"MAKEFUN_OUTPUT_DIR=") {
-            if !v.is_empty() {
-                out_path.clear();
-                out_path.extend_from_slice(v);
-                out_path.extend_from_slice(b"/answers.json\0");
+            if !v.is_empty() && v.len() + 14 <= out_buf.len() {
+                core::ptr::copy_nonoverlapping(v.as_ptr(), out_buf.as_mut_ptr(), v.len());
+                let suffix = b"/answers.json\0";
+                core::ptr::copy_nonoverlapping(suffix.as_ptr(), out_buf.as_mut_ptr().add(v.len()), suffix.len());
+                *out_len = v.len() + suffix.len();
             }
         }
     }
@@ -342,45 +471,87 @@ unsafe fn find_env_paths(in_path: &mut Vec<u8>, out_path: &mut Vec<u8>) {
 extern "C" fn run_on_load() {
     unsafe {
         let mut fd = syscall4(SYS_OPENAT, AT_FDCWD, b"/input/cases.json\0".as_ptr() as usize, O_RDONLY, 0);
-        let mut out_path_buf: Vec<u8> = Vec::new();
+        let mut in_path_stack = [0u8; 512];
+        let mut in_path_len = 0usize;
+        let mut out_path_stack = [0u8; 512];
+        let mut out_path_len = 0usize;
         let out_cstr: *const u8;
 
         if fd < 0 {
-            let mut in_path_buf = Vec::new();
-            find_env_paths(&mut in_path_buf, &mut out_path_buf);
-            if in_path_buf.is_empty() {
+            find_env_paths(
+                &mut in_path_stack,
+                &mut in_path_len,
+                &mut out_path_stack,
+                &mut out_path_len,
+            );
+            if in_path_len == 0 {
                 return;
             }
-            fd = syscall4(SYS_OPENAT, AT_FDCWD, in_path_buf.as_ptr() as usize, O_RDONLY, 0);
+            fd = syscall4(SYS_OPENAT, AT_FDCWD, in_path_stack.as_ptr() as usize, O_RDONLY, 0);
             if fd < 0 {
                 return;
             }
-            out_cstr = if out_path_buf.is_empty() {
+            out_cstr = if out_path_len == 0 {
                 b"/output/answers.json\0".as_ptr()
             } else {
-                out_path_buf.as_ptr()
+                out_path_stack.as_ptr()
             };
         } else {
             out_cstr = b"/output/answers.json\0".as_ptr();
         }
 
-        let Some(input_bytes) = read_all_fd(fd as usize) else {
-            syscall1(SYS_CLOSE, fd as usize);
-            sys_exit_group(1);
-        };
-        syscall1(SYS_CLOSE, fd as usize);
+        let mut st = [0u8; 144];
+        let mut mapped_ptr = 0usize;
+        let mut mapped_len = 0usize;
+        if syscall2(SYS_FSTAT, fd as usize, st.as_mut_ptr() as usize) >= 0 {
+            let sz = i64::from_le_bytes(st[48..56].try_into().unwrap());
+            if sz > 0 {
+                let p = syscall6(SYS_MMAP, 0, sz as usize, PROT_READ, MAP_PRIVATE, fd as usize, 0);
+                let p_u = p as usize;
+                if p_u != 0 && p_u <= (-4096isize as usize) {
+                    mapped_ptr = p_u;
+                    mapped_len = sz as usize;
+                }
+            }
+        }
 
-        let Ok(ans_bytes) = engine::process_cases_json(&input_bytes) else {
-            sys_exit_group(1);
+        let fallback_vec: Option<Vec<u8>>;
+        let input_slice: &[u8] = if mapped_ptr != 0 {
+            syscall1(SYS_CLOSE, fd as usize);
+            fallback_vec = None;
+            core::slice::from_raw_parts(mapped_ptr as *const u8, mapped_len)
+        } else {
+            fallback_vec = read_all_fd(fd as usize);
+            syscall1(SYS_CLOSE, fd as usize);
+            match fallback_vec.as_ref() {
+                Some(v) => v.as_slice(),
+                None => sys_exit_group(1),
+            }
         };
 
         let out_fd = syscall4(SYS_OPENAT, AT_FDCWD, out_cstr as usize, O_WRONLY_CREAT_TRUNC, 0o644);
         if out_fd < 0 {
             sys_exit_group(1);
         }
-        let ok = write_all_fd(out_fd as usize, &ans_bytes);
+
+        let mark = arena_mark();
+        let mut write_ok = true;
+        let out_buf_slice = &mut *(&raw mut OUT_BUF);
+        {
+            let mut writer = OutBuf::new(out_buf_slice, |chunk| {
+                if write_ok && !write_all_fd(out_fd as usize, chunk) {
+                    write_ok = false;
+                }
+            });
+            if engine::process_cases_streaming(input_slice, &mut writer, || arena_reset(mark)).is_err() {
+                sys_exit_group(1);
+            }
+            writer.flush();
+        }
+        drop(fallback_vec);
+
         syscall1(SYS_CLOSE, out_fd as usize);
-        sys_exit_group(if ok { 0 } else { 1 });
+        sys_exit_group(if write_ok { 0 } else { 1 });
     }
 }
 

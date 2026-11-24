@@ -5,23 +5,22 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::frontmatter::{normalize_newlines, parse_front_matter, FmResult};
 use crate::json::Case;
-use crate::markdown::{render_markdown, TocItem};
+use crate::markdown::{render_markdown_into, MdScratch, TocItem};
+use crate::out::ByteSink;
 use crate::simd::find_byte;
-use crate::template::{fold_site_ops, inline_template, parse_template, render_ops, CardCache, Node, Op, Scope, Val, ValueSource};
-use crate::text::{cmp_utf16, escape_json_into, long_date_into, push_usize, slugify_vec, words_of};
+use crate::template::{
+    compile_ops, fold_site_ops, inline_template, ops_use_escaped_md_html, parse_template,
+    render_compiled_ops, CompiledOp, LoopFrame, Node, Op, RenderCtx, RuntimeCard, RuntimeCardTag,
+    RuntimePage, RuntimePager, RuntimeTagPage, RuntimeTagSummary, Val, ValueSource,
+};
+use crate::text::{
+    cmp_utf16, escape_html_then_json_into, escape_json_into, fast_hash, long_date_into,
+    needs_html_or_json_escape, needs_json_escape, push_usize, slugify_into, words_of,
+};
 
 const RESERVED: [&[u8]; 3] = [b"posts", b"tags", b"page"];
 
-// Open-addressed FNV-1a 64-bit hash map/set for no_std speed without external dependencies.
-#[inline]
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
+// ---------------------------------------------------------------- Hash Maps / Sets (64-bit fast_hash)
 
 struct StrMap<'a> {
     slots: Vec<Option<(u64, &'a [u8], usize)>>,
@@ -38,7 +37,7 @@ impl<'a> StrMap<'a> {
     }
 
     fn insert(&mut self, key: &'a [u8], val: usize) {
-        let h = fnv1a(key);
+        let h = fast_hash(key);
         let mut idx = (h as usize) & self.mask;
         loop {
             match self.slots[idx] {
@@ -57,7 +56,7 @@ impl<'a> StrMap<'a> {
 
     #[inline]
     fn get(&self, key: &[u8]) -> Option<usize> {
-        let h = fnv1a(key);
+        let h = fast_hash(key);
         let mut idx = (h as usize) & self.mask;
         loop {
             match self.slots[idx] {
@@ -91,7 +90,7 @@ impl OwnedStrSet {
             let new_mask = new_cap - 1;
             let mut new_slots = vec![None; new_cap];
             for (idx_item, item) in self.items.iter().enumerate() {
-                let h = fnv1a(item);
+                let h = fast_hash(item);
                 let mut i = (h as usize) & new_mask;
                 while new_slots[i].is_some() {
                     i = (i + 1) & new_mask;
@@ -103,15 +102,15 @@ impl OwnedStrSet {
         }
     }
 
-    fn insert(&mut self, val: Vec<u8>) -> bool {
+    fn insert_slice(&mut self, val: &[u8]) -> bool {
         self.maybe_grow();
-        let h = fnv1a(&val);
+        let h = fast_hash(val);
         let mut idx = (h as usize) & self.mask;
         loop {
             match self.slots[idx] {
                 None => {
                     let id = self.items.len();
-                    self.items.push(val);
+                    self.items.push(val.to_vec());
                     self.slots[idx] = Some((h, id));
                     return true;
                 }
@@ -121,8 +120,9 @@ impl OwnedStrSet {
         }
     }
 
+    #[inline]
     fn contains(&self, val: &[u8]) -> bool {
-        let h = fnv1a(val);
+        let h = fast_hash(val);
         let mut idx = (h as usize) & self.mask;
         loop {
             match self.slots[idx] {
@@ -134,6 +134,71 @@ impl OwnedStrSet {
     }
 }
 
+struct TagSlugIndex {
+    slugs: Vec<Vec<u8>>,
+    slots: Vec<Option<(u64, usize)>>,
+    mask: usize,
+}
+
+impl TagSlugIndex {
+    fn new(n: usize) -> Self {
+        let cap = (n.max(16) * 2).next_power_of_two();
+        Self {
+            slugs: Vec::with_capacity(n),
+            slots: vec![None; cap],
+            mask: cap - 1,
+        }
+    }
+
+    #[inline]
+    fn get(&self, slug: &[u8]) -> Option<usize> {
+        let h = fast_hash(slug);
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            match self.slots[idx] {
+                None => return None,
+                Some((eh, id)) if eh == h && self.slugs[id] == slug => return Some(id),
+                _ => idx = (idx + 1) & self.mask,
+            }
+        }
+    }
+
+    #[inline]
+    fn get_or_insert_slice(&mut self, slug: &[u8]) -> (usize, bool) {
+        if (self.slugs.len() + 1) * 2 > self.slots.len() {
+            let nc = self.slots.len() * 2;
+            let nm = nc - 1;
+            let mut ns = vec![None; nc];
+            for (id, s) in self.slugs.iter().enumerate() {
+                let h = fast_hash(s);
+                let mut i = (h as usize) & nm;
+                while ns[i].is_some() {
+                    i = (i + 1) & nm;
+                }
+                ns[i] = Some((h, id));
+            }
+            self.slots = ns;
+            self.mask = nm;
+        }
+        let h = fast_hash(slug);
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            match self.slots[idx] {
+                None => {
+                    let id = self.slugs.len();
+                    self.slugs.push(slug.to_vec());
+                    self.slots[idx] = Some((h, id));
+                    return (id, true);
+                }
+                Some((eh, id)) if eh == h && self.slugs[id] == slug => return (id, false),
+                _ => idx = (idx + 1) & self.mask,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Path / URI Helpers
+
 #[inline]
 fn dir_of(path: &[u8]) -> &[u8] {
     match path.iter().rposition(|&c| c == b'/') {
@@ -142,9 +207,10 @@ fn dir_of(path: &[u8]) -> &[u8] {
     }
 }
 
-fn resolve_rel_path(dir: &[u8], rel: &[u8], out: &mut Vec<u8>) -> bool {
+#[inline]
+fn resolve_rel_path(dir: &[u8], rel: &[u8], out: &mut Vec<u8>, seg_ends: &mut Vec<usize>) -> bool {
     out.clear();
-    let mut seg_ends: Vec<usize> = Vec::with_capacity(8);
+    seg_ends.clear();
     if !dir.is_empty() {
         for part in dir.split(|&c| c == b'/') {
             if !out.is_empty() {
@@ -190,14 +256,13 @@ fn has_uri_scheme(target: &[u8]) -> bool {
     i < target.len() && target[i] == b':'
 }
 
-// ---------------------------------------------------------------- Template Value Adapters
+// ---------------------------------------------------------------- Fold Value Adapters (Site Globals Only)
 
-struct SiteVal<'a> {
+struct FoldSite<'a> {
     title: &'a [u8],
     base_url: &'a [u8],
 }
-
-impl<'a> ValueSource for SiteVal<'a> {
+impl<'a> ValueSource for FoldSite<'a> {
     #[inline]
     fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
         match key {
@@ -208,14 +273,13 @@ impl<'a> ValueSource for SiteVal<'a> {
     }
 }
 
-struct TagSummaryVal<'a> {
+struct FoldTagSummary<'a> {
     name: &'a [u8],
     slug: &'a [u8],
     url: &'a [u8],
     count: usize,
 }
-
-impl<'a> ValueSource for TagSummaryVal<'a> {
+impl<'a> ValueSource for FoldTagSummary<'a> {
     #[inline]
     fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
         match key {
@@ -228,13 +292,12 @@ impl<'a> ValueSource for TagSummaryVal<'a> {
     }
 }
 
-struct CardTagVal<'a> {
+struct FoldCardTag<'a> {
     name: &'a [u8],
     slug: &'a [u8],
     url: &'a [u8],
 }
-
-impl<'a> ValueSource for CardTagVal<'a> {
+impl<'a> ValueSource for FoldCardTag<'a> {
     #[inline]
     fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
         match key {
@@ -246,8 +309,8 @@ impl<'a> ValueSource for CardTagVal<'a> {
     }
 }
 
-struct CardVal<'a> {
-    id: usize,
+struct FoldRecentCard<'a> {
+    md_json_mode: bool,
     title: &'a [u8],
     url: &'a [u8],
     date: &'a [u8],
@@ -257,8 +320,7 @@ struct CardVal<'a> {
     reading_minutes: usize,
     tag_refs: &'a [&'a dyn ValueSource],
 }
-
-impl<'a> ValueSource for CardVal<'a> {
+impl<'a> ValueSource for FoldRecentCard<'a> {
     #[inline]
     fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
         match key {
@@ -267,138 +329,24 @@ impl<'a> ValueSource for CardVal<'a> {
             b"date" => Some(Val::Str(self.date)),
             b"date_long" => Some(Val::Str(self.date_long)),
             b"summary" => Some(Val::Str(self.summary)),
-            b"excerpt" => Some(Val::Str(self.excerpt)),
+            b"excerpt" => Some(if self.md_json_mode {
+                Val::PreJsonStr(self.excerpt)
+            } else {
+                Val::Str(self.excerpt)
+            }),
             b"reading_minutes" => Some(Val::Num(self.reading_minutes)),
             b"tags" => Some(Val::Arr(self.tag_refs)),
             _ => None,
         }
     }
-    #[inline]
-    fn post_id(&self) -> Option<usize> {
-        Some(self.id)
-    }
 }
 
-struct TocVal<'a> {
-    level: usize,
-    id: &'a [u8],
-    html: &'a [u8],
-}
-
-impl<'a> ValueSource for TocVal<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        match key {
-            b"level" => Some(Val::Num(self.level)),
-            b"id" => Some(Val::Str(self.id)),
-            b"html" => Some(Val::Str(self.html)),
-            _ => None,
-        }
-    }
-}
-
-struct LinkVal<'a> {
-    title: &'a [u8],
-    url: &'a [u8],
-    date: &'a [u8],
-    date_long: &'a [u8],
-}
-
-impl<'a> ValueSource for LinkVal<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        match key {
-            b"title" => Some(Val::Str(self.title)),
-            b"url" => Some(Val::Str(self.url)),
-            b"date" => Some(Val::Str(self.date)),
-            b"date_long" => Some(Val::Str(self.date_long)),
-            _ => None,
-        }
-    }
-}
-
-struct PageVal<'a> {
-    card: &'a CardVal<'a>,
-    slug: &'a [u8],
-    content: &'a [u8],
-    toc: &'a [&'a dyn ValueSource],
-    newer: Option<&'a LinkVal<'a>>,
-    older: Option<&'a LinkVal<'a>>,
-    is_post: bool,
-}
-
-impl<'a> ValueSource for PageVal<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        match key {
-            b"slug" => Some(Val::Str(self.slug)),
-            b"content" => Some(Val::Str(self.content)),
-            b"toc" => Some(Val::Arr(self.toc)),
-            b"newer" => Some(match self.newer {
-                Some(l) => Val::Obj(l),
-                None => Val::Null,
-            }),
-            b"older" => Some(match self.older {
-                Some(l) => Val::Obj(l),
-                None => Val::Null,
-            }),
-            b"is_post" => Some(Val::Bool(self.is_post)),
-            _ => self.card.prop(key),
-        }
-    }
-}
-
-struct PagerVal<'a> {
-    number: usize,
-    total: usize,
-    url: &'a [u8],
-    newer_url: &'a [u8],
-    older_url: &'a [u8],
-}
-
-impl<'a> ValueSource for PagerVal<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        match key {
-            b"number" => Some(Val::Num(self.number)),
-            b"total" => Some(Val::Num(self.total)),
-            b"url" => Some(Val::Str(self.url)),
-            b"newer_url" => Some(Val::Str(self.newer_url)),
-            b"older_url" => Some(Val::Str(self.older_url)),
-            _ => None,
-        }
-    }
-}
-
-struct TagFullVal<'a> {
-    name: &'a [u8],
-    slug: &'a [u8],
-    url: &'a [u8],
-    count: usize,
-    posts: &'a [&'a dyn ValueSource],
-}
-
-impl<'a> ValueSource for TagFullVal<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        match key {
-            b"name" => Some(Val::Str(self.name)),
-            b"slug" => Some(Val::Str(self.slug)),
-            b"url" => Some(Val::Str(self.url)),
-            b"count" => Some(Val::Num(self.count)),
-            b"posts" => Some(Val::Arr(self.posts)),
-            _ => None,
-        }
-    }
-}
-
-struct GlobalsScope<'a> {
-    site: &'a SiteVal<'a>,
+struct FoldGlobals<'a> {
+    site: &'a FoldSite<'a>,
     tags: &'a [&'a dyn ValueSource],
     recent: &'a [&'a dyn ValueSource],
 }
-
-impl<'a> ValueSource for GlobalsScope<'a> {
+impl<'a> ValueSource for FoldGlobals<'a> {
     #[inline]
     fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
         match key {
@@ -410,82 +358,52 @@ impl<'a> ValueSource for GlobalsScope<'a> {
     }
 }
 
-struct PageScope<'a> {
-    page: &'a PageVal<'a>,
-}
-impl<'a> ValueSource for PageScope<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        if key == b"page" { Some(Val::Obj(self.page)) } else { None }
-    }
-}
-
-struct IndexScope<'a> {
-    posts: &'a [&'a dyn ValueSource],
-    pager: &'a PagerVal<'a>,
-}
-impl<'a> ValueSource for IndexScope<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        match key {
-            b"posts" => Some(Val::Arr(self.posts)),
-            b"pager" => Some(Val::Obj(self.pager)),
-            _ => None,
-        }
-    }
-}
-
-struct TagScope<'a> {
-    tag: &'a TagFullVal<'a>,
-}
-impl<'a> ValueSource for TagScope<'a> {
-    #[inline]
-    fn prop(&self, key: &[u8]) -> Option<Val<'_>> {
-        if key == b"tag" { Some(Val::Obj(self.tag)) } else { None }
-    }
-}
-
 // ---------------------------------------------------------------- JSON Output Emitter
 
-#[inline]
-fn emit_kv_pre_json(out: &mut Vec<u8>, first: &mut bool, key: &[u8], pre_json_val: &[u8]) {
-    if !*first {
-        out.push(b',');
-    }
-    *first = false;
-    out.push(b'"');
-    escape_json_into(key, out);
-    out.extend_from_slice(b"\":\"");
-    out.extend_from_slice(pre_json_val);
-    out.push(b'"');
+#[inline(always)]
+fn escape_pre_vec(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut hj = Vec::with_capacity(raw.len() + 4);
+    escape_html_then_json_into(raw, &mut hj);
+    let mut j = Vec::with_capacity(raw.len() + 4);
+    escape_json_into(raw, &mut j);
+    (hj, j)
 }
 
-#[inline]
-fn emit_kv_raw(out: &mut Vec<u8>, first: &mut bool, key: &[u8], raw_val: &[u8]) {
+#[inline(always)]
+fn emit_kv_raw<S: ByteSink>(out: &mut S, first: &mut bool, key: &[u8], raw_val: &[u8]) {
     if !*first {
         out.push(b',');
     }
     *first = false;
     out.push(b'"');
     escape_json_into(key, out);
-    out.extend_from_slice(b"\":\"");
+    out.write_slice(b"\":\"");
     escape_json_into(raw_val, out);
     out.push(b'"');
 }
 
 // ---------------------------------------------------------------- Site Pipeline
 
-pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
+pub fn build_site_into_json<'a, S: ByteSink>(case: &'a Case<'a>, out_json: &mut S) {
+    let pool = &case.str_pool;
+
     // 1. Parse templates sorted by name (UTF-16 code units).
     let mut tpl_order: Vec<usize> = (0..case.templates.len()).collect();
-    tpl_order.sort_by(|&a, &b| cmp_utf16(&case.templates[a].name, &case.templates[b].name));
+    tpl_order.sort_by(|&a, &b| {
+        cmp_utf16(
+            case.templates[a].name.as_bytes(pool),
+            case.templates[b].name.as_bytes(pool),
+        )
+    });
 
     let mut parsed_tpls: Vec<(&[u8], Vec<Node>)> = Vec::with_capacity(tpl_order.len());
     let mut report_lines: Vec<String> = Vec::new();
     for idx in tpl_order {
         let t = &case.templates[idx];
-        match parse_template(&t.name, &t.source) {
-            Ok(nodes) => parsed_tpls.push((&t.name, nodes)),
+        let name = t.name.as_bytes(pool);
+        let source = t.source.as_bytes(pool);
+        match parse_template(name, source) {
+            Ok(nodes) => parsed_tpls.push((name, nodes)),
             Err(msg) => report_lines.push(msg),
         }
     }
@@ -493,14 +411,22 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         parsed_tpls.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_slice())
     };
 
-    let mut base: &[u8] = &case.site.base_url;
+    let site_title = case.site.title.as_bytes(pool);
+    let mut base: &[u8] = case.site.base_url.as_bytes(pool);
     while base.ends_with(b"/") {
         base = &base[..base.len() - 1];
     }
+    let base_safe_hj = !needs_html_or_json_escape(base);
+    let base_safe_j = base_safe_hj || !needs_json_escape(base);
 
     // 2. Partition & sort input files by path (UTF-16 code units).
     let mut file_order: Vec<usize> = (0..case.files.len()).collect();
-    file_order.sort_by(|&a, &b| cmp_utf16(&case.files[a].path, &case.files[b].path));
+    file_order.sort_by(|&a, &b| {
+        cmp_utf16(
+            case.files[a].path.as_bytes(pool),
+            case.files[b].path.as_bytes(pool),
+        )
+    });
 
     struct StaticItem<'a> {
         path: &'a [u8],
@@ -513,44 +439,21 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
 
     for idx in file_order {
         let f = &case.files[idx];
-        if f.path.ends_with(b".md") {
-            norm_texts.push(normalize_newlines(&f.content));
+        let p = f.path.as_bytes(pool);
+        let c = f.content.as_bytes(pool);
+        if p.ends_with(b".md") {
+            if !f.has_cr {
+                norm_texts.push(Cow::Borrowed(c));
+            } else {
+                norm_texts.push(normalize_newlines(c));
+            }
             md_raw_indices.push(idx);
         } else {
-            statics.push(StaticItem {
-                path: &f.path,
-                content: &f.content,
-            });
+            statics.push(StaticItem { path: p, content: c });
         }
     }
 
-    struct SourceItem<'a, 'b> {
-        title: Cow<'a, [u8]>,
-        date: Option<&'b [u8]>,
-        date_long: Vec<u8>,
-        raw_tags: Vec<&'b [u8]>,
-        layout_idx: usize,
-        slug: Vec<u8>,
-        out_dir: Vec<u8>,
-        url: Vec<u8>,
-        summary: Cow<'a, [u8]>,
-        body_words: usize,
-        html: Vec<u8>,
-        toc: Vec<TocItem>,
-        excerpt: Vec<u8>,
-        is_post: bool,
-        post_rank: usize,
-        newer: Option<usize>,
-        older: Option<usize>,
-        tag_indices: Vec<usize>,
-        page_own_tags: Vec<(Vec<u8>, Vec<u8>, Option<usize>)>,
-    }
-
-    let mut sources: Vec<SourceItem<'a, '_>> = Vec::with_capacity(norm_texts.len());
-
-    // 3. Parse front matter (borrowing into norm_texts!).
-    // Note: keep a temporary vec of FM results aligned with `norm_texts` or build sources referencing `norm_texts`.
-    // Wait: we can compute words_of + drop unused rejected files immediately; kept sources point to `norm_texts[k]`.
+    // 3. Parse front matter.
     struct FmParsed<'a, 'b> {
         src_path: &'a [u8],
         title: Cow<'b, [u8]>,
@@ -563,8 +466,10 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         body: &'b [u8],
     }
     let mut fm_kept: Vec<FmParsed<'a, '_>> = Vec::with_capacity(norm_texts.len());
+    let mut used_layout_flags = vec![false; parsed_tpls.len()];
+
     for (k, &orig_idx) in md_raw_indices.iter().enumerate() {
-        let path = case.files[orig_idx].path.as_ref();
+        let path = case.files[orig_idx].path.as_bytes(pool);
         let text = norm_texts[k].as_ref();
         let path_str = core::str::from_utf8(path).unwrap_or("");
         let fm = match parse_front_matter(text) {
@@ -592,7 +497,10 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
             Some(li) => li,
             None => {
                 let lstr = core::str::from_utf8(layout_name).unwrap_or("");
-                report_lines.push(format!("refused {}: layout \"{}\" is no template that parses", path_str, lstr));
+                report_lines.push(format!(
+                    "refused {}: layout \"{}\" is no template that parses",
+                    path_str, lstr
+                ));
                 continue;
             }
         };
@@ -600,6 +508,7 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
             report_lines.push(format!("draft {}", path_str));
             continue;
         }
+        used_layout_flags[layout_idx] = true;
         fm_kept.push(FmParsed {
             src_path: path,
             title: fm.title,
@@ -613,16 +522,86 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         });
     }
 
+    // Determine `md_json_mode` early by inlining all used templates!
+    let mut inlined_pages: Vec<Option<Vec<Op>>> = vec![None; parsed_tpls.len()];
+    let mut uses_escaped_md = false;
+    for (li, (_, nodes)) in parsed_tpls.iter().enumerate() {
+        if used_layout_flags[li] {
+            let mut ops = Vec::with_capacity(32);
+            inline_template(nodes, &get_tpl, 0, &mut ops);
+            if ops_use_escaped_md_html(&ops) {
+                uses_escaped_md = true;
+            }
+            inlined_pages[li] = Some(ops);
+        }
+    }
+    let inlined_index: Option<Vec<Op>> = get_tpl(b"index").map(|nodes| {
+        let mut ops = Vec::with_capacity(32);
+        inline_template(nodes, &get_tpl, 0, &mut ops);
+        if ops_use_escaped_md_html(&ops) {
+            uses_escaped_md = true;
+        }
+        ops
+    });
+    let inlined_tag: Option<Vec<Op>> = get_tpl(b"tag").map(|nodes| {
+        let mut ops = Vec::with_capacity(32);
+        inline_template(nodes, &get_tpl, 0, &mut ops);
+        if ops_use_escaped_md_html(&ops) {
+            uses_escaped_md = true;
+        }
+        ops
+    });
+    let inlined_tags: Option<Vec<Op>> = get_tpl(b"tags").map(|nodes| {
+        let mut ops = Vec::with_capacity(32);
+        inline_template(nodes, &get_tpl, 0, &mut ops);
+        if ops_use_escaped_md_html(&ops) {
+            uses_escaped_md = true;
+        }
+        ops
+    });
+    let md_json_mode = !uses_escaped_md;
+
     // 4. Permalinks (per-directory unique slugs).
+    struct SourceItem<'a, 'b> {
+        title: Cow<'b, [u8]>,
+        title_safe_hj: bool,
+        title_safe_j: bool,
+        date: Option<&'b [u8]>,
+        date_long: Vec<u8>,
+        raw_tags: Vec<&'b [u8]>,
+        layout_idx: usize,
+        slug: Vec<u8>,
+        out_dir: Vec<u8>,
+        url: Vec<u8>,
+        url_safe_hj: bool,
+        url_safe_j: bool,
+        summary: Cow<'b, [u8]>,
+        summary_safe_hj: bool,
+        summary_safe_j: bool,
+        reading_minutes: usize,
+        is_post: bool,
+        post_rank: usize,
+        newer: Option<usize>,
+        older: Option<usize>,
+        tag_indices: Vec<usize>,
+        own_tags_meta: Vec<(Vec<u8>, Vec<u8>, Option<usize>)>,
+        recent_slot: Option<usize>,
+        body: &'b [u8],
+        src_path: &'a [u8],
+    }
+
     let mut dir_sets: Vec<(&[u8], OwnedStrSet)> = Vec::with_capacity(12);
     let mut root_set = OwnedStrSet::with_capacity(64);
     for r in RESERVED {
-        root_set.insert(r.to_vec());
+        root_set.insert_slice(r);
     }
     dir_sets.push((b"", root_set));
 
     let mut by_source = StrMap::with_capacity(fm_kept.len());
-    for (si, f) in fm_kept.iter().enumerate() {
+    let mut sources: Vec<SourceItem<'a, '_>> = Vec::with_capacity(fm_kept.len());
+    let mut slug_buf: Vec<u8> = Vec::with_capacity(72);
+
+    for (si, f) in fm_kept.into_iter().enumerate() {
         let dir = if f.is_post { &b"posts"[..] } else { dir_of(f.src_path) };
         let set_pos = match dir_sets.iter().position(|(d, _)| *d == dir) {
             Some(p) => p,
@@ -631,20 +610,22 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
                 dir_sets.len() - 1
             }
         };
-        let mut slug = match f.slug_override {
-            Some(so) => so.to_vec(),
-            None => slugify_vec(&f.title),
-        };
-        let base_len = slug.len();
+        slug_buf.clear();
+        match f.slug_override {
+            Some(so) => slug_buf.extend_from_slice(so),
+            None => slugify_into(&f.title, &mut slug_buf),
+        }
+        let base_len = slug_buf.len();
         let taken = &mut dir_sets[set_pos].1;
         let mut n = 2usize;
-        while taken.contains(&slug) {
-            slug.truncate(base_len);
-            slug.push(b'-');
-            push_usize(n, &mut slug);
+        while taken.contains(&slug_buf) {
+            slug_buf.truncate(base_len);
+            slug_buf.push(b'-');
+            push_usize(n, &mut slug_buf);
             n += 1;
         }
-        taken.insert(slug.clone());
+        taken.insert_slice(&slug_buf);
+        let slug = slug_buf.clone();
 
         let mut out_dir = Vec::with_capacity(dir.len() + 1 + slug.len());
         if dir.is_empty() {
@@ -660,94 +641,65 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         url.extend_from_slice(&out_dir);
         url.push(b'/');
 
+        let url_safe_hj = base_safe_hj && !needs_html_or_json_escape(&out_dir);
+        let url_safe_j = url_safe_hj || (base_safe_j && !needs_json_escape(&out_dir));
+
         let mut date_long = Vec::new();
         if let Some(d) = f.date {
             date_long.reserve(20);
             long_date_into(d, &mut date_long);
         }
+
+        let title_safe_hj = !needs_html_or_json_escape(&f.title);
+        let title_safe_j = title_safe_hj || !needs_json_escape(&f.title);
+        let summary = f.summary.unwrap_or(Cow::Borrowed(&b""[..]));
+        let summary_safe_hj = summary.is_empty() || !needs_html_or_json_escape(&summary);
+        let summary_safe_j = summary_safe_hj || !needs_json_escape(&summary);
+
         let body_words = words_of(f.body);
+        let reading_minutes = ((body_words + 199) / 200).max(1);
 
         by_source.insert(f.src_path, si);
         sources.push(SourceItem {
-            title: Cow::Owned(f.title.to_vec()),
+            title: f.title,
+            title_safe_hj,
+            title_safe_j,
             date: f.date,
             date_long,
-            raw_tags: f.raw_tags.clone(),
+            raw_tags: f.raw_tags,
             layout_idx: f.layout_idx,
             slug,
             out_dir,
             url,
-            summary: f.summary.as_ref().map(|c| Cow::Owned(c.to_vec())).unwrap_or(Cow::Borrowed(b"")),
-            body_words,
-            html: Vec::new(),
-            toc: Vec::new(),
-            excerpt: Vec::new(),
+            url_safe_hj,
+            url_safe_j,
+            summary,
+            summary_safe_hj,
+            summary_safe_j,
+            reading_minutes,
             is_post: f.is_post,
             post_rank: 0,
             newer: None,
             older: None,
             tag_indices: Vec::new(),
-            page_own_tags: Vec::new(),
+            own_tags_meta: Vec::new(),
+            recent_slot: None,
+            body: f.body,
+            src_path: f.src_path,
         });
     }
 
-    // 5. Markdown rendering & link resolution.
+    // 5. Link resolver shared structures.
     let mut static_map = StrMap::with_capacity(statics.len());
-    for (si, st) in statics.iter().enumerate() {
-        static_map.insert(st.path, si);
+    for (idx, st) in statics.iter().enumerate() {
+        static_map.insert(st.path, idx);
     }
+    let has_index_static = statics.iter().any(|st| st.path.ends_with(b"index.html"));
+    let mut static_shadowed = vec![false; statics.len()];
+
     let mut broken_links = OwnedStrSet::with_capacity(64);
     let mut rel_buf = Vec::with_capacity(128);
-
-    // Collect URLs separately so link closure doesn't conflict with mutably updating sources[si].
-    let md_outputs: Vec<_> = {
-        let urls: Vec<&[u8]> = sources.iter().map(|s| s.url.as_slice()).collect();
-        let mut outs = Vec::with_capacity(fm_kept.len());
-        for f in &fm_kept {
-            let dir = dir_of(f.src_path);
-            let mut link_fn = |target: &[u8], out: &mut Vec<u8>| {
-                if has_uri_scheme(target) || target.starts_with(b"/") || target.starts_with(b"#") {
-                    out.extend_from_slice(target);
-                    return;
-                }
-                let hash_pos = find_byte(target, 0, b'#');
-                let (rel, frag) = if hash_pos < target.len() {
-                    (&target[..hash_pos], &target[hash_pos..])
-                } else {
-                    (target, &b""[..])
-                };
-                let ok = !rel.is_empty() && resolve_rel_path(dir, rel, &mut rel_buf);
-                if ok {
-                    if let Some(target_si) = by_source.get(&rel_buf) {
-                        out.extend_from_slice(urls[target_si]);
-                        out.extend_from_slice(frag);
-                        return;
-                    }
-                    if static_map.get(&rel_buf).is_some() {
-                        out.extend_from_slice(base);
-                        out.push(b'/');
-                        out.extend_from_slice(&rel_buf);
-                        out.extend_from_slice(frag);
-                        return;
-                    }
-                }
-                let mut bmsg = Vec::with_capacity(14 + f.src_path.len() + 4 + target.len());
-                bmsg.extend_from_slice(b"broken-link ");
-                bmsg.extend_from_slice(f.src_path);
-                bmsg.extend_from_slice(b" -> ");
-                bmsg.extend_from_slice(target);
-                broken_links.insert(bmsg);
-                out.extend_from_slice(target);
-            };
-            outs.push(render_markdown(f.body, &mut link_fn));
-        }
-        outs
-    };
-    for (si, md) in md_outputs.into_iter().enumerate() {
-        sources[si].html = md.html;
-        sources[si].toc = md.toc;
-        sources[si].excerpt = md.excerpt;
-    }
+    let mut seg_ends: Vec<usize> = Vec::with_capacity(12);
 
     // 6. Collections: posts sorted newest date first, then slug ascending (code units).
     let mut posts: Vec<usize> = sources
@@ -765,74 +717,32 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         sources[si].newer = if k == 0 { None } else { Some(posts[k - 1]) };
         sources[si].older = if k + 1 == posts.len() { None } else { Some(posts[k + 1]) };
     }
+    let recent_count = case.site.recent.min(posts.len());
+    for (ri, &si) in posts[..recent_count].iter().enumerate() {
+        sources[si].recent_slot = Some(ri);
+    }
 
-    // 7. Tags: grouped by slug in posts' collections order, then ordered by count desc & slug asc.
-    struct TagEntry<'a> {
-        name: &'a [u8],
+    // 7. Tags: grouped by slug in posts' collection order, sorted by count desc & slug asc.
+    struct TagEntry<'b> {
+        name: &'b [u8],
+        name_hj: Vec<u8>,
+        name_j: Vec<u8>,
         slug: Vec<u8>,
         url: Vec<u8>,
-        posts: Vec<usize>, // stores `post_rank` (index in `posts`)!
+        url_hj: Vec<u8>,
+        url_j: Vec<u8>,
+        post_sis: Vec<usize>,
     }
     let mut tag_entries: Vec<TagEntry<'_>> = Vec::with_capacity(64);
-    struct TagSlugIndex {
-        slugs: Vec<Vec<u8>>,
-        slots: Vec<Option<(u64, usize)>>,
-        mask: usize,
-    }
-    impl TagSlugIndex {
-        fn new(n: usize) -> Self {
-            let cap = (n.max(16) * 2).next_power_of_two();
-            Self { slugs: Vec::with_capacity(n), slots: vec![None; cap], mask: cap - 1 }
-        }
-        fn get(&self, slug: &[u8]) -> Option<usize> {
-            let h = fnv1a(slug);
-            let mut idx = (h as usize) & self.mask;
-            loop {
-                match self.slots[idx] {
-                    None => return None,
-                    Some((eh, id)) if eh == h && self.slugs[id] == slug => return Some(id),
-                    _ => idx = (idx + 1) & self.mask,
-                }
-            }
-        }
-        fn get_or_insert(&mut self, slug: Vec<u8>) -> (usize, bool) {
-            if (self.slugs.len() + 1) * 2 > self.slots.len() {
-                let nc = self.slots.len() * 2;
-                let nm = nc - 1;
-                let mut ns = vec![None; nc];
-                for (id, s) in self.slugs.iter().enumerate() {
-                    let h = fnv1a(s);
-                    let mut i = (h as usize) & nm;
-                    while ns[i].is_some() { i = (i + 1) & nm; }
-                    ns[i] = Some((h, id));
-                }
-                self.slots = ns;
-                self.mask = nm;
-            }
-            let h = fnv1a(&slug);
-            let mut idx = (h as usize) & self.mask;
-            loop {
-                match self.slots[idx] {
-                    None => {
-                        let id = self.slugs.len();
-                        self.slugs.push(slug);
-                        self.slots[idx] = Some((h, id));
-                        return (id, true);
-                    }
-                    Some((eh, id)) if eh == h && self.slugs[id] == slug => return (id, false),
-                    _ => idx = (idx + 1) & self.mask,
-                }
-            }
-        }
-    }
-
     let mut ts_idx = TagSlugIndex::new(64);
-    for (post_rank, &si) in posts.iter().enumerate() {
+
+    for &si in &posts {
         let mut seen_this_post: Vec<usize> = Vec::with_capacity(8);
         let raw_list = core::mem::take(&mut sources[si].raw_tags);
-        for name in &raw_list {
-            let slug = slugify_vec(name);
-            let (tid, inserted) = ts_idx.get_or_insert(slug);
+        for name in raw_list {
+            slug_buf.clear();
+            slugify_into(name, &mut slug_buf);
+            let (tid, inserted) = ts_idx.get_or_insert_slice(&slug_buf);
             if inserted {
                 let s_ref = &ts_idx.slugs[tid];
                 let mut turl = Vec::with_capacity(base.len() + 7 + s_ref.len());
@@ -840,273 +750,461 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
                 turl.extend_from_slice(b"/tags/");
                 turl.extend_from_slice(s_ref);
                 turl.push(b'/');
+                let (name_hj, name_j) = escape_pre_vec(name);
+                let (url_hj, url_j) = escape_pre_vec(&turl);
                 tag_entries.push(TagEntry {
                     name,
+                    name_hj,
+                    name_j,
                     slug: s_ref.clone(),
                     url: turl,
-                    posts: Vec::with_capacity(16),
+                    url_hj,
+                    url_j,
+                    post_sis: Vec::with_capacity(16),
                 });
             }
             if !seen_this_post.contains(&tid) {
                 seen_this_post.push(tid);
-                tag_entries[tid].posts.push(post_rank);
+                tag_entries[tid].post_sis.push(si);
             }
         }
         sources[si].tag_indices = seen_this_post;
-        sources[si].raw_tags = raw_list;
     }
 
-    // Non-post sources' tags (`ownTags`, matched against post tags by slug, else url="" and own name).
     for si in 0..sources.len() {
         if sources[si].is_post {
             continue;
         }
         let mut seen_slugs: Vec<Vec<u8>> = Vec::with_capacity(6);
         let mut own = Vec::with_capacity(6);
-        for &name in &sources[si].raw_tags {
-            let slug = slugify_vec(name);
-            if seen_slugs.iter().any(|x| x == &slug) {
+        let raw_list = core::mem::take(&mut sources[si].raw_tags);
+        for name in raw_list {
+            slug_buf.clear();
+            slugify_into(name, &mut slug_buf);
+            if seen_slugs.iter().any(|x| x.as_slice() == slug_buf.as_slice()) {
                 continue;
             }
-            seen_slugs.push(slug.clone());
-            if let Some(tid) = ts_idx.get(&slug) {
-                own.push((tag_entries[tid].name.to_vec(), tag_entries[tid].slug.clone(), Some(tid)));
+            seen_slugs.push(slug_buf.clone());
+            if let Some(tid) = ts_idx.get(&slug_buf) {
+                own.push((
+                    tag_entries[tid].name.to_vec(),
+                    tag_entries[tid].slug.clone(),
+                    Some(tid),
+                ));
             } else {
-                own.push((name.to_vec(), slug, None));
+                own.push((name.to_vec(), slug_buf.clone(), None));
             }
         }
-        sources[si].page_own_tags = own;
+        sources[si].own_tags_meta = own;
     }
 
     let mut tag_order: Vec<usize> = (0..tag_entries.len()).collect();
     tag_order.sort_by(|&a, &b| {
         tag_entries[b]
-            .posts
+            .post_sis
             .len()
-            .cmp(&tag_entries[a].posts.len())
+            .cmp(&tag_entries[a].post_sis.len())
             .then_with(|| cmp_utf16(&tag_entries[a].slug, &tag_entries[b].slug))
     });
 
-    // 8. Build template value objects and compile + site-fold templates!
-    let site_val = SiteVal {
-        title: &case.site.title,
+    // 8. Pre-render ONLY the `recent_count` posts before site constant folding!
+    struct RecentRendered {
+        html: Vec<u8>,
+        toc: Vec<TocItem>,
+        excerpt: Vec<u8>,
+    }
+    let urls: Vec<&[u8]> = sources.iter().map(|s| s.url.as_slice()).collect();
+    let mut md_scratch = MdScratch::new();
+    let mut recent_pre: Vec<RecentRendered> = Vec::with_capacity(recent_count);
+
+    for &si in &posts[..recent_count] {
+        let src_path = sources[si].src_path;
+        let dir = dir_of(src_path);
+        let body = sources[si].body;
+        let mut link_fn = |target: &[u8], out: &mut Vec<u8>| {
+            if has_uri_scheme(target) || target.starts_with(b"/") || target.starts_with(b"#") {
+                out.extend_from_slice(target);
+                return;
+            }
+            let hash_pos = find_byte(target, 0, b'#');
+            let (rel, frag) = if hash_pos < target.len() {
+                (&target[..hash_pos], &target[hash_pos..])
+            } else {
+                (target, &b""[..])
+            };
+            let ok = !rel.is_empty() && resolve_rel_path(dir, rel, &mut rel_buf, &mut seg_ends);
+            if ok {
+                if let Some(target_si) = by_source.get(&rel_buf) {
+                    out.extend_from_slice(urls[target_si]);
+                    out.extend_from_slice(frag);
+                    return;
+                }
+                if static_map.get(&rel_buf).is_some() {
+                    out.extend_from_slice(base);
+                    out.push(b'/');
+                    out.extend_from_slice(&rel_buf);
+                    out.extend_from_slice(frag);
+                    return;
+                }
+            }
+            let mut bmsg = Vec::with_capacity(16 + src_path.len() + target.len());
+            bmsg.extend_from_slice(b"broken-link ");
+            bmsg.extend_from_slice(src_path);
+            bmsg.extend_from_slice(b" -> ");
+            bmsg.extend_from_slice(target);
+            broken_links.insert_slice(&bmsg);
+            out.extend_from_slice(target);
+        };
+        if md_json_mode {
+            render_markdown_into::<true, _>(body, &mut link_fn, &mut md_scratch);
+        } else {
+            render_markdown_into::<false, _>(body, &mut link_fn, &mut md_scratch);
+        }
+        let ex = md_scratch.excerpt_slice().to_vec();
+        recent_pre.push(RecentRendered {
+            html: core::mem::take(&mut md_scratch.html),
+            toc: core::mem::take(&mut md_scratch.toc),
+            excerpt: ex,
+        });
+    }
+
+    // Build FoldGlobals and fold + compile templates!
+    let fold_site = FoldSite {
+        title: site_title,
         base_url: base,
     };
-
-    let card_tag_vals: Vec<CardTagVal<'_>> = tag_entries
+    let fold_tag_cards: Vec<FoldCardTag<'_>> = tag_entries
         .iter()
-        .map(|te| CardTagVal {
+        .map(|te| FoldCardTag {
             name: te.name,
             slug: &te.slug,
             url: &te.url,
         })
         .collect();
-
-    let all_tag_summaries: Vec<TagSummaryVal<'_>> = tag_order
+    let fold_all_tags: Vec<FoldTagSummary<'_>> = tag_order
         .iter()
         .map(|&tid| {
             let te = &tag_entries[tid];
-            TagSummaryVal {
+            FoldTagSummary {
                 name: te.name,
                 slug: &te.slug,
                 url: &te.url,
-                count: te.posts.len(),
+                count: te.post_sis.len(),
             }
         })
         .collect();
-    let all_tag_refs: Vec<&dyn ValueSource> = all_tag_summaries.iter().map(|t| t as &dyn ValueSource).collect();
+    let fold_all_tag_refs: Vec<&dyn ValueSource> =
+        fold_all_tags.iter().map(|t| t as &dyn ValueSource).collect();
 
-    // Per-source CardTagVal slices:
-    let mut source_tag_storage: Vec<Vec<CardTagVal<'_>>> = Vec::with_capacity(sources.len());
+    let mut fold_recent_tag_refs: Vec<Vec<&dyn ValueSource>> = Vec::with_capacity(recent_count);
+    for &si in &posts[..recent_count] {
+        fold_recent_tag_refs.push(
+            sources[si]
+                .tag_indices
+                .iter()
+                .map(|&tid| &fold_tag_cards[tid] as &dyn ValueSource)
+                .collect(),
+        );
+    }
+    let fold_recent_cards: Vec<FoldRecentCard<'_>> = posts[..recent_count]
+        .iter()
+        .enumerate()
+        .map(|(ri, &si)| {
+            let s = &sources[si];
+            FoldRecentCard {
+                md_json_mode,
+                title: &s.title,
+                url: &s.url,
+                date: s.date.unwrap_or(b""),
+                date_long: &s.date_long,
+                summary: &s.summary,
+                excerpt: &recent_pre[ri].excerpt,
+                reading_minutes: s.reading_minutes,
+                tag_refs: &fold_recent_tag_refs[ri],
+            }
+        })
+        .collect();
+    let fold_recent_refs: Vec<&dyn ValueSource> = fold_recent_cards
+        .iter()
+        .map(|c| c as &dyn ValueSource)
+        .collect();
+    let fold_globals = FoldGlobals {
+        site: &fold_site,
+        tags: &fold_all_tag_refs,
+        recent: &fold_recent_refs,
+    };
+
+    let mut card_patterns: Vec<Vec<CompiledOp>> = Vec::new();
+    let compiled_pages: Vec<Option<Vec<CompiledOp>>> = inlined_pages
+        .into_iter()
+        .map(|opt| {
+            opt.map(|ops| {
+                let folded = fold_site_ops(&ops, &fold_globals, true, false, false, &[]);
+                compile_ops(&folded, true, false, false, &mut card_patterns)
+            })
+        })
+        .collect();
+    let compiled_index: Option<Vec<CompiledOp>> = inlined_index.map(|ops| {
+        let folded = fold_site_ops(&ops, &fold_globals, false, false, true, &[]);
+        compile_ops(&folded, false, false, true, &mut card_patterns)
+    });
+    let compiled_tag: Option<Vec<CompiledOp>> = inlined_tag.map(|ops| {
+        let folded = fold_site_ops(&ops, &fold_globals, false, true, false, &[]);
+        compile_ops(&folded, false, true, false, &mut card_patterns)
+    });
+    let compiled_tags: Option<Vec<CompiledOp>> = inlined_tags.map(|ops| {
+        let folded = fold_site_ops(&ops, &fold_globals, false, false, false, &[]);
+        compile_ops(&folded, false, false, false, &mut card_patterns)
+    });
+
+    // Build non-post own tag runtime structs + pre-escaped strings.
+    struct OwnTagPre {
+        name: Vec<u8>,
+        name_hj: Vec<u8>,
+        name_j: Vec<u8>,
+        slug: Vec<u8>,
+    }
+    let mut own_tag_pres: Vec<Vec<OwnTagPre>> = Vec::with_capacity(sources.len());
     for s in &sources {
-        if s.is_post {
-            source_tag_storage.push(Vec::new());
+        if s.is_post || s.own_tags_meta.is_empty() {
+            own_tag_pres.push(Vec::new());
         } else {
-            source_tag_storage.push(
-                s.page_own_tags
+            own_tag_pres.push(
+                s.own_tags_meta
                     .iter()
-                    .map(|(nm, sl, tid_opt)| CardTagVal {
-                        name: nm,
-                        slug: sl,
-                        url: match tid_opt {
-                            Some(tid) => &tag_entries[*tid].url,
-                            None => b"",
-                        },
+                    .filter(|(_, _, tid_opt)| tid_opt.is_none())
+                    .map(|(nm, sl, _)| {
+                        let (name_hj, name_j) = escape_pre_vec(nm);
+                        OwnTagPre {
+                            name: nm.clone(),
+                            name_hj,
+                            name_j,
+                            slug: sl.clone(),
+                        }
                     })
                     .collect(),
             );
         }
     }
-    let mut source_tag_refs: Vec<Vec<&dyn ValueSource>> = Vec::with_capacity(sources.len());
+
+    let post_tag_cards: Vec<RuntimeCardTag<'_>> = tag_entries
+        .iter()
+        .map(|te| RuntimeCardTag {
+            name: te.name,
+            name_hj: &te.name_hj,
+            name_j: &te.name_j,
+            slug: &te.slug,
+            url: &te.url,
+            url_hj: &te.url_hj,
+            url_j: &te.url_j,
+        })
+        .collect();
+
+    let mut source_own_tag_cards: Vec<Vec<RuntimeCardTag<'_>>> = Vec::with_capacity(sources.len());
     for (si, s) in sources.iter().enumerate() {
-        if s.is_post {
-            source_tag_refs.push(
-                s.tag_indices
-                    .iter()
-                    .map(|&tid| &card_tag_vals[tid] as &dyn ValueSource)
-                    .collect(),
-            );
+        if s.is_post || s.own_tags_meta.is_empty() {
+            source_own_tag_cards.push(Vec::new());
         } else {
-            source_tag_refs.push(source_tag_storage[si].iter().map(|c| c as &dyn ValueSource).collect());
+            let mut unresolved_idx = 0usize;
+            let mut v = Vec::with_capacity(s.own_tags_meta.len());
+            for &(_, _, tid_opt) in &s.own_tags_meta {
+                match tid_opt {
+                    Some(tid) => {
+                        let te = &tag_entries[tid];
+                        v.push(RuntimeCardTag {
+                            name: te.name,
+                            name_hj: &te.name_hj,
+                            name_j: &te.name_j,
+                            slug: &te.slug,
+                            url: &te.url,
+                            url_hj: &te.url_hj,
+                            url_j: &te.url_j,
+                        });
+                    }
+                    None => {
+                        let pre = &own_tag_pres[si][unresolved_idx];
+                        unresolved_idx += 1;
+                        v.push(RuntimeCardTag {
+                            name: &pre.name,
+                            name_hj: &pre.name_hj,
+                            name_j: &pre.name_j,
+                            slug: &pre.slug,
+                            url: b"",
+                            url_hj: b"",
+                            url_j: b"",
+                        });
+                    }
+                }
+            }
+            source_own_tag_cards.push(v);
         }
     }
 
-    let cards: Vec<CardVal<'_>> = sources
+    let global_tags: Vec<RuntimeTagSummary<'_>> = tag_order
+        .iter()
+        .map(|&tid| {
+            let te = &tag_entries[tid];
+            RuntimeTagSummary {
+                name: te.name,
+                name_hj: &te.name_hj,
+                name_j: &te.name_j,
+                slug: &te.slug,
+                url: &te.url,
+                url_hj: &te.url_hj,
+                url_j: &te.url_j,
+                count: te.post_sis.len(),
+            }
+        })
+        .collect();
+
+    let mut cards: Vec<RuntimeCard<'_>> = sources
         .iter()
         .enumerate()
-        .map(|(si, s)| CardVal {
-            id: s.post_rank,
+        .map(|(si, s)| RuntimeCard {
+            post_rank: s.post_rank,
             title: &s.title,
+            title_safe_hj: s.title_safe_hj,
+            title_safe_j: s.title_safe_j,
             url: &s.url,
+            url_safe_hj: s.url_safe_hj,
+            url_safe_j: s.url_safe_j,
             date: s.date.unwrap_or(b""),
             date_long: &s.date_long,
             summary: &s.summary,
-            excerpt: &s.excerpt,
-            reading_minutes: ((s.body_words + 199) / 200).max(1),
-            tag_refs: &source_tag_refs[si],
+            summary_safe_hj: s.summary_safe_hj,
+            summary_safe_j: s.summary_safe_j,
+            excerpt: match s.recent_slot {
+                Some(ri) => &recent_pre[ri].excerpt,
+                None => b"",
+            },
+            reading_minutes: s.reading_minutes,
+            tag_ids: &s.tag_indices,
+            own_tags: &source_own_tag_cards[si],
+            is_post: s.is_post,
         })
         .collect();
 
-    let recent_count = case.site.recent.min(posts.len());
-    let recent_refs: Vec<&dyn ValueSource> = posts[..recent_count]
+    let recent_sis = &posts[..recent_count];
+    let mut frames: Vec<LoopFrame> = Vec::with_capacity(8);
+    let mut caches: Vec<Vec<Option<Vec<u8>>>> = card_patterns
         .iter()
-        .map(|&si| &cards[si] as &dyn ValueSource)
+        .map(|_| vec![None; posts.len()])
         .collect();
 
-    let globals = GlobalsScope {
-        site: &site_val,
-        tags: &all_tag_refs,
-        recent: &recent_refs,
-    };
-
-    // Compile, include-inline, and site-constant-fold each template role!
-    let mut compiled_page_tpls: Vec<Vec<Op>> = Vec::with_capacity(parsed_tpls.len());
-    for (name, nodes) in &parsed_tpls {
-        // Check whether this template is ever referenced as a page/post layout (might still be `index`/`tag`/`tags` too!)
-        let is_used_layout = sources.iter().any(|s| parsed_tpls[s.layout_idx].0 == *name);
-        if is_used_layout {
-            let mut inlined = Vec::new();
-            inline_template(nodes, &get_tpl, 0, &mut inlined);
-            let folded = fold_site_ops(&inlined, &globals, true, false, false, &[]);
-            compiled_page_tpls.push(folded);
-        } else {
-            compiled_page_tpls.push(Vec::new());
-        }
-    }
-
-    let compiled_index: Option<Vec<Op>> = get_tpl(b"index").map(|nodes| {
-        let mut inlined = Vec::new();
-        inline_template(nodes, &get_tpl, 0, &mut inlined);
-        fold_site_ops(&inlined, &globals, false, false, true, &[])
-    });
-    let compiled_tag: Option<Vec<Op>> = get_tpl(b"tag").map(|nodes| {
-        let mut inlined = Vec::new();
-        inline_template(nodes, &get_tpl, 0, &mut inlined);
-        fold_site_ops(&inlined, &globals, false, true, false, &[])
-    });
-    let compiled_tags: Option<Vec<Op>> = get_tpl(b"tags").map(|nodes| {
-        let mut inlined = Vec::new();
-        inline_template(nodes, &get_tpl, 0, &mut inlined);
-        fold_site_ops(&inlined, &globals, false, false, false, &[])
-    });
-
-    // Discover pure card loop body pattern for CardCache!
-    fn find_first_pure_card_body<'a>(ops: &'a [Op], path_root: &[u8]) -> Option<&'a [Op]> {
-        for op in ops {
-            match op {
-                Op::For { path, body, pure_item_loop, .. } if *pure_item_loop && path[0].as_slice() == path_root => {
-                    return Some(body.as_slice());
-                }
-                Op::If { then_ops, else_ops, .. } => {
-                    if let Some(b) = find_first_pure_card_body(then_ops, path_root) {
-                        return Some(b);
-                    }
-                    if let Some(eo) = else_ops {
-                        if let Some(b) = find_first_pure_card_body(eo, path_root) {
-                            return Some(b);
-                        }
-                    }
-                }
-                Op::For { body, .. } => {
-                    if let Some(b) = find_first_pure_card_body(body, path_root) {
-                        return Some(b);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-    let card_pattern = compiled_index
-        .as_ref()
-        .and_then(|ops| find_first_pure_card_body(ops, b"posts"))
-        .or_else(|| compiled_tag.as_ref().and_then(|ops| find_first_pure_card_body(ops, b"tag")));
-    let mut card_cache = card_pattern.map(|pat| CardCache {
-        body_pattern: pat,
-        cached: vec![None; posts.len()],
-    });
-
-    // Precompute TOC & Link objects and emit JSON!
+    let mut key_buf: Vec<u8> = Vec::with_capacity(128);
     out_json.push(b'{');
     let mut first_kv = true;
-    let mut built_paths = OwnedStrSet::with_capacity(sources.len() + tag_entries.len() + 64);
-    let mut key_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut page_html_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
 
-    let links: Vec<LinkVal<'_>> = sources
-        .iter()
-        .map(|s| LinkVal {
-            title: &s.title,
-            url: &s.url,
-            date: s.date.unwrap_or(b""),
-            date_long: &s.date_long,
-        })
-        .collect();
-
-    let toc_storage: Vec<Vec<TocVal<'_>>> = sources
-        .iter()
-        .map(|s| {
-            s.toc
-                .iter()
-                .map(|h| TocVal {
-                    level: h.level as usize,
-                    id: &h.id,
-                    html: &h.html,
-                })
-                .collect()
-        })
-        .collect();
-    let toc_refs: Vec<Vec<&dyn ValueSource>> = toc_storage
-        .iter()
-        .map(|tv| tv.iter().map(|h| h as &dyn ValueSource).collect())
-        .collect();
-
-    // Render all pages & posts
-    let mut no_cache: Option<CardCache<'_>> = None;
+    // 9. Stream-render every page/post directly into `out_json`!
+    let mut post_excerpts: Vec<Option<Vec<u8>>> = vec![None; posts.len()];
     for (si, s) in sources.iter().enumerate() {
-        let pval = PageVal {
-            card: &cards[si],
+        let layout_ops = compiled_pages[s.layout_idx].as_ref().unwrap();
+        let (content_slice, toc_slice, excerpt_slice): (&[u8], &[TocItem], &[u8]) =
+            if let Some(ri) = s.recent_slot {
+                (
+                    &recent_pre[ri].html,
+                    &recent_pre[ri].toc,
+                    &recent_pre[ri].excerpt,
+                )
+            } else {
+                let src_path = s.src_path;
+                let dir = dir_of(src_path);
+                let mut link_fn = |target: &[u8], out: &mut Vec<u8>| {
+                    if has_uri_scheme(target) || target.starts_with(b"/") || target.starts_with(b"#") {
+                        out.extend_from_slice(target);
+                        return;
+                    }
+                    let hash_pos = find_byte(target, 0, b'#');
+                    let (rel, frag) = if hash_pos < target.len() {
+                        (&target[..hash_pos], &target[hash_pos..])
+                    } else {
+                        (target, &b""[..])
+                    };
+                    let ok = !rel.is_empty()
+                        && resolve_rel_path(dir, rel, &mut rel_buf, &mut seg_ends);
+                    if ok {
+                        if let Some(target_si) = by_source.get(&rel_buf) {
+                            out.extend_from_slice(urls[target_si]);
+                            out.extend_from_slice(frag);
+                            return;
+                        }
+                        if static_map.get(&rel_buf).is_some() {
+                            out.extend_from_slice(base);
+                            out.push(b'/');
+                            out.extend_from_slice(&rel_buf);
+                            out.extend_from_slice(frag);
+                            return;
+                        }
+                    }
+                    let mut bmsg = Vec::with_capacity(16 + src_path.len() + target.len());
+                    bmsg.extend_from_slice(b"broken-link ");
+                    bmsg.extend_from_slice(src_path);
+                    bmsg.extend_from_slice(b" -> ");
+                    bmsg.extend_from_slice(target);
+                    broken_links.insert_slice(&bmsg);
+                    out.extend_from_slice(target);
+                };
+                if md_json_mode {
+                    render_markdown_into::<true, _>(s.body, &mut link_fn, &mut md_scratch);
+                } else {
+                    render_markdown_into::<false, _>(s.body, &mut link_fn, &mut md_scratch);
+                }
+                if s.is_post {
+                    post_excerpts[s.post_rank] = Some(md_scratch.excerpt_slice().to_vec());
+                }
+                (&md_scratch.html, &md_scratch.toc, md_scratch.excerpt_slice())
+            };
+
+        let rpage = RuntimePage {
+            source_idx: si,
             slug: &s.slug,
-            content: &s.html,
-            toc: &toc_refs[si],
-            newer: s.newer.map(|ni| &links[ni]),
-            older: s.older.map(|oi| &links[oi]),
-            is_post: s.is_post,
+            content: content_slice,
+            toc: toc_slice,
+            newer: s.newer,
+            older: s.older,
         };
-        let pscope = PageScope { page: &pval };
-        let gscope = Scope { vars: &globals, parent: None };
-        let scope = Scope { vars: &pscope, parent: Some(&gscope) };
-        page_html_buf.clear();
-        render_ops(&compiled_page_tpls[s.layout_idx], &scope, &mut no_cache, &mut page_html_buf);
+        let rctx = RenderCtx {
+            md_json_mode,
+            site_title,
+            site_base_url: base,
+            cards: &cards,
+            global_tags: &global_tags,
+            post_tag_cards: &post_tag_cards,
+            recent_sis,
+            posts_slice: &[],
+            page: Some(&rpage),
+            page_excerpt_override: Some(excerpt_slice),
+            pager: None,
+            tag: None,
+        };
 
         key_buf.clear();
         key_buf.extend_from_slice(&s.out_dir);
         key_buf.extend_from_slice(b"/index.html");
-        built_paths.insert(key_buf.clone());
-        emit_kv_pre_json(out_json, &mut first_kv, &key_buf, &page_html_buf);
+        if has_index_static {
+            if let Some(st_idx) = static_map.get(&key_buf) {
+                static_shadowed[st_idx] = true;
+            }
+        }
+        if !first_kv {
+            out_json.push(b',');
+        }
+        first_kv = false;
+        out_json.push(b'"');
+        escape_json_into(&key_buf, out_json);
+        out_json.write_slice(b"\":\"");
+        render_compiled_ops(layout_ops, &rctx, &mut frames, &mut caches, out_json);
+        out_json.push(b'"');
     }
 
-    // Render paginated index pages
+    // Attach remaining post excerpts for `index` and `tag` cards.
+    for (pr, &si) in posts.iter().enumerate() {
+        if let Some(ref ex) = post_excerpts[pr] {
+            cards[si].excerpt = ex.as_slice();
+        }
+    }
+
+    // 10. Render paginated index pages directly into `out_json`.
     if let Some(ref idx_ops) = compiled_index {
         let per = case.site.per_page;
         let pages = ((posts.len() + per - 1) / per).max(1);
@@ -1124,14 +1222,10 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         let mut u_cur = Vec::with_capacity(64);
         let mut u_newer = Vec::with_capacity(64);
         let mut u_older = Vec::with_capacity(64);
-        let mut post_card_refs: Vec<&dyn ValueSource> = Vec::with_capacity(per);
+
         for k in 1..=pages {
             let start = (k - 1) * per;
             let end = (k * per).min(posts.len());
-            post_card_refs.clear();
-            for &si in &posts[start..end] {
-                post_card_refs.push(&cards[si]);
-            }
             make_index_url(k, &mut u_cur);
             if k == 1 {
                 u_newer.clear();
@@ -1143,21 +1237,29 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
             } else {
                 make_index_url(k + 1, &mut u_older);
             }
-            let pager = PagerVal {
+            let rpager = RuntimePager {
                 number: k,
                 total: pages,
                 url: &u_cur,
                 newer_url: &u_newer,
                 older_url: &u_older,
+                url_safe_hj: base_safe_hj,
+                url_safe_j: base_safe_j,
             };
-            let iscope = IndexScope {
-                posts: &post_card_refs,
-                pager: &pager,
+            let rctx = RenderCtx {
+                md_json_mode,
+                site_title,
+                site_base_url: base,
+                cards: &cards,
+                global_tags: &global_tags,
+                post_tag_cards: &post_tag_cards,
+                recent_sis,
+                posts_slice: &posts[start..end],
+                page: None,
+                page_excerpt_override: None,
+                pager: Some(&rpager),
+                tag: None,
             };
-            let gscope = Scope { vars: &globals, parent: None };
-            let scope = Scope { vars: &iscope, parent: Some(&gscope) };
-            page_html_buf.clear();
-            render_ops(idx_ops, &scope, &mut card_cache, &mut page_html_buf);
 
             key_buf.clear();
             if k == 1 {
@@ -1167,54 +1269,107 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
                 push_usize(k, &mut key_buf);
                 key_buf.extend_from_slice(b"/index.html");
             }
-            built_paths.insert(key_buf.clone());
-            emit_kv_pre_json(out_json, &mut first_kv, &key_buf, &page_html_buf);
+            if has_index_static {
+                if let Some(st_idx) = static_map.get(&key_buf) {
+                    static_shadowed[st_idx] = true;
+                }
+            }
+            if !first_kv {
+                out_json.push(b',');
+            }
+            first_kv = false;
+            out_json.push(b'"');
+            out_json.write_slice(&key_buf);
+            out_json.write_slice(b"\":\"");
+            render_compiled_ops(idx_ops, &rctx, &mut frames, &mut caches, out_json);
+            out_json.push(b'"');
         }
     }
 
-    // Render tag pages
+    // 11. Render tag pages directly into `out_json`.
     if let Some(ref tag_ops) = compiled_tag {
-        let mut tpost_refs: Vec<&dyn ValueSource> = Vec::with_capacity(64);
         for &tid in &tag_order {
             let te = &tag_entries[tid];
-            tpost_refs.clear();
-            for &pr in &te.posts {
-                tpost_refs.push(&cards[posts[pr]]);
-            }
-            let tval = TagFullVal {
+            let rtag = RuntimeTagPage {
                 name: te.name,
+                name_hj: &te.name_hj,
+                name_j: &te.name_j,
                 slug: &te.slug,
                 url: &te.url,
-                count: te.posts.len(),
-                posts: &tpost_refs,
+                url_hj: &te.url_hj,
+                url_j: &te.url_j,
+                count: te.post_sis.len(),
+                post_sis: &te.post_sis,
             };
-            let tscope = TagScope { tag: &tval };
-            let gscope = Scope { vars: &globals, parent: None };
-            let scope = Scope { vars: &tscope, parent: Some(&gscope) };
-            page_html_buf.clear();
-            render_ops(tag_ops, &scope, &mut card_cache, &mut page_html_buf);
+            let rctx = RenderCtx {
+                md_json_mode,
+                site_title,
+                site_base_url: base,
+                cards: &cards,
+                global_tags: &global_tags,
+                post_tag_cards: &post_tag_cards,
+                recent_sis,
+                posts_slice: &[],
+                page: None,
+                page_excerpt_override: None,
+                pager: None,
+                tag: Some(&rtag),
+            };
 
             key_buf.clear();
             key_buf.extend_from_slice(b"tags/");
             key_buf.extend_from_slice(&te.slug);
             key_buf.extend_from_slice(b"/index.html");
-            built_paths.insert(key_buf.clone());
-            emit_kv_pre_json(out_json, &mut first_kv, &key_buf, &page_html_buf);
+            if has_index_static {
+                if let Some(st_idx) = static_map.get(&key_buf) {
+                    static_shadowed[st_idx] = true;
+                }
+            }
+            if !first_kv {
+                out_json.push(b',');
+            }
+            first_kv = false;
+            out_json.push(b'"');
+            out_json.write_slice(&key_buf);
+            out_json.write_slice(b"\":\"");
+            render_compiled_ops(tag_ops, &rctx, &mut frames, &mut caches, out_json);
+            out_json.push(b'"');
         }
     }
 
-    // Render tags/index.html
+    // 12. Render `tags/index.html` directly into `out_json`.
     if let Some(ref tags_ops) = compiled_tags {
-        let gscope = Scope { vars: &globals, parent: None };
-        page_html_buf.clear();
-        render_ops(tags_ops, &gscope, &mut no_cache, &mut page_html_buf);
-        built_paths.insert(b"tags/index.html".to_vec());
-        emit_kv_pre_json(out_json, &mut first_kv, b"tags/index.html", &page_html_buf);
+        let rctx = RenderCtx {
+            md_json_mode,
+            site_title,
+            site_base_url: base,
+            cards: &cards,
+            global_tags: &global_tags,
+            post_tag_cards: &post_tag_cards,
+            recent_sis,
+            posts_slice: &[],
+            page: None,
+            page_excerpt_override: None,
+            pager: None,
+            tag: None,
+        };
+        if has_index_static {
+            if let Some(st_idx) = static_map.get(b"tags/index.html") {
+                static_shadowed[st_idx] = true;
+            }
+        }
+        if !first_kv {
+            out_json.push(b',');
+        }
+        first_kv = false;
+        out_json.write_slice(b"\"tags/index.html\":\"");
+        render_compiled_ops(tags_ops, &rctx, &mut frames, &mut caches, out_json);
+        out_json.push(b'"');
     }
 
-    // Static files (`shadowed` if a built page already has its path).
-    for st in &statics {
-        if built_paths.contains(st.path) {
+    // 13. Static files.
+    for (idx, st) in statics.iter().enumerate() {
+        if static_shadowed[idx] {
             let pstr = core::str::from_utf8(st.path).unwrap_or("");
             report_lines.push(format!("shadowed {}: a built page has its path", pstr));
         } else if st.path != b"build-report.txt" {
@@ -1222,8 +1377,9 @@ pub fn build_site_into_json<'a>(case: &'a Case<'a>, out_json: &mut Vec<u8>) {
         }
     }
 
-    // 9. Report (`build-report.txt`)
-    let mut all_lines: Vec<Vec<u8>> = Vec::with_capacity(report_lines.len() + broken_links.items.len());
+    // 14. Report (`build-report.txt`).
+    let mut all_lines: Vec<Vec<u8>> =
+        Vec::with_capacity(report_lines.len() + broken_links.items.len());
     for l in report_lines {
         all_lines.push(l.into_bytes());
     }

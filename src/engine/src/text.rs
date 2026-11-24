@@ -1,7 +1,11 @@
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use crate::nfkd_table::{is_empty_nfkd, lookup_map};
-use crate::simd::{find_html_json_special, find_html_special, find_json_special};
+use crate::out::ByteSink;
+use crate::simd::{
+    escape_html_sse2, escape_html_then_json_sse2, escape_json_sse2, find_html_json_special,
+    find_json_special, words_of_sse2,
+};
 
 pub const SLUG_MAX: usize = 64;
 
@@ -10,7 +14,27 @@ const MONTHS: [&[u8]; 12] = [
     b"July", b"August", b"September", b"October", b"November", b"December",
 ];
 
-#[inline]
+const ASCII_SLUG: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut c = b'0';
+    while c <= b'9' {
+        t[c as usize] = c;
+        c += 1;
+    }
+    let mut c = b'a';
+    while c <= b'z' {
+        t[c as usize] = c;
+        c += 1;
+    }
+    let mut c = b'A';
+    while c <= b'Z' {
+        t[c as usize] = c + 32;
+        c += 1;
+    }
+    t
+};
+
+#[inline(always)]
 pub fn decode_utf8(b: &[u8], i: usize) -> (u32, usize) {
     let b0 = b[i] as u32;
     if b0 < 0x80 {
@@ -34,6 +58,24 @@ pub fn decode_utf8(b: &[u8], i: usize) -> (u32, usize) {
     }
 }
 
+/// Fast 64-bit word hash for hash tables in `site.rs`.
+#[inline]
+pub fn fast_hash(bytes: &[u8]) -> u64 {
+    let mut h = 0x9e3779b97f4a7c15u64 ^ ((bytes.len() as u64).wrapping_mul(0x517cc1b727220a95));
+    let mut i = 0usize;
+    let ptr = bytes.as_ptr();
+    while i + 8 <= bytes.len() {
+        let w = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
+        h = (h ^ w).wrapping_mul(0x517cc1b727220a95).rotate_left(13);
+        i += 8;
+    }
+    while i < bytes.len() {
+        h = (h ^ unsafe { *ptr.add(i) as u64 }).wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    h ^ (h >> 33)
+}
+
 /// Compare two UTF-8 byte slices in JS UTF-16 code-unit order (`a < b ? -1 : a > b ? 1 : 0`).
 #[inline]
 pub fn cmp_utf16(a: &[u8], b: &[u8]) -> Ordering {
@@ -53,12 +95,9 @@ pub fn cmp_utf16(a: &[u8], b: &[u8]) -> Ordering {
     if i == min_len {
         return a.len().cmp(&b.len());
     }
-    // Fast path: if differing bytes are both < 0xEE (so neither is 0xEE..0xEF BMP >= U+E000 vs 0xF0..0xF4 surrogate),
-    // wait: continuation bytes could belong to an earlier multi-byte char >= 0xEE! Rewind to char start first if needed.
     if (a[i] & 0xC0) != 0x80 && (b[i] & 0xC0) != 0x80 && a[i] < 0xEE && b[i] < 0xEE {
         return a[i].cmp(&b[i]);
     }
-    // Slow path: step back to UTF-8 codepoint boundary and compare UTF-16 code units.
     while i > 0 && (a[i] & 0xC0) == 0x80 {
         i -= 1;
     }
@@ -175,116 +214,47 @@ pub fn trim_ascii_ht_sp(b: &[u8]) -> &[u8] {
 
 #[inline]
 pub fn is_blank_ht_sp(b: &[u8]) -> bool {
-    b.iter().all(|&c| c == b' ' || c == b'\t')
+    let mut i = 0;
+    let len = b.len();
+    while i < len {
+        let c = b[i];
+        if c != b' ' && c != b'\t' {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Count words matching JS `text.match(/\S+/g)?.length ?? 0`.
+#[inline]
 pub fn words_of(text: &[u8]) -> usize {
-    let mut count = 0usize;
-    let mut in_word = false;
-    let mut i = 0;
-    let len = text.len();
-    while i < len {
-        let c = text[i];
-        if c < 0x80 {
-            let ws = c == b' ' || (c >= 0x09 && c <= 0x0D);
-            if ws {
-                in_word = false;
-            } else if !in_word {
-                in_word = true;
-                count += 1;
-            }
-            i += 1;
-        } else {
-            let (cp, l) = decode_utf8(text, i);
-            let ws = is_js_ws_cp(cp);
-            if ws {
-                in_word = false;
-            } else if !in_word {
-                in_word = true;
-                count += 1;
-            }
-            i += l;
-        }
-    }
-    count
+    words_of_sse2(text)
 }
 
-pub fn escape_html_into(s: &[u8], out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < s.len() {
-        let j = find_html_special(s, i);
-        if j > i {
-            out.extend_from_slice(&s[i..j]);
-        }
-        if j == s.len() {
-            break;
-        }
-        match s[j] {
-            b'&' => out.extend_from_slice(b"&amp;"),
-            b'<' => out.extend_from_slice(b"&lt;"),
-            b'>' => out.extend_from_slice(b"&gt;"),
-            b'"' => out.extend_from_slice(b"&quot;"),
-            b'\'' => out.extend_from_slice(b"&#39;"),
-            _ => {}
-        }
-        i = j + 1;
-    }
+#[inline(always)]
+pub fn needs_html_or_json_escape(s: &[u8]) -> bool {
+    find_html_json_special(s, 0) < s.len()
+}
+
+#[inline(always)]
+pub fn needs_json_escape(s: &[u8]) -> bool {
+    find_json_special(s, 0) < s.len()
 }
 
 #[inline]
-fn push_json_escape(c: u8, out: &mut Vec<u8>) {
-    match c {
-        b'"' => out.extend_from_slice(b"\\\""),
-        b'\\' => out.extend_from_slice(b"\\\\"),
-        0x08 => out.extend_from_slice(b"\\b"),
-        0x09 => out.extend_from_slice(b"\\t"),
-        0x0A => out.extend_from_slice(b"\\n"),
-        0x0C => out.extend_from_slice(b"\\f"),
-        0x0D => out.extend_from_slice(b"\\r"),
-        _ => {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            out.extend_from_slice(&[b'\\', b'u', b'0', b'0', HEX[(c >> 4) as usize], HEX[(c & 0xF) as usize]]);
-        }
-    }
+pub fn escape_html_into<S: ByteSink>(s: &[u8], out: &mut S) {
+    escape_html_sse2(s, out);
 }
 
-pub fn escape_json_into(s: &[u8], out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < s.len() {
-        let j = find_json_special(s, i);
-        if j > i {
-            out.extend_from_slice(&s[i..j]);
-        }
-        if j == s.len() {
-            break;
-        }
-        push_json_escape(s[j], out);
-        i = j + 1;
-    }
+#[inline]
+pub fn escape_json_into<S: ByteSink>(s: &[u8], out: &mut S) {
+    escape_json_sse2(s, out);
 }
 
-/// Escape HTML (& < > " ') AND JSON-escape quotes in one SIMD pass directly into `out`.
-pub fn escape_html_then_json_into(s: &[u8], out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < s.len() {
-        let j = find_html_json_special(s, i);
-        if j > i {
-            out.extend_from_slice(&s[i..j]);
-        }
-        if j == s.len() {
-            break;
-        }
-        match s[j] {
-            b'&' => out.extend_from_slice(b"&amp;"),
-            b'<' => out.extend_from_slice(b"&lt;"),
-            b'>' => out.extend_from_slice(b"&gt;"),
-            b'"' => out.extend_from_slice(b"&quot;"),
-            b'\'' => out.extend_from_slice(b"&#39;"),
-            c => push_json_escape(c, out),
-        }
-        i = j + 1;
-    }
+#[inline]
+pub fn escape_html_then_json_into<S: ByteSink>(s: &[u8], out: &mut S) {
+    escape_html_then_json_sse2(s, out);
 }
 
 /// Exact Node 22 slugify matching `vendor/makefun-site/lib/text.js`.
@@ -295,19 +265,13 @@ pub fn slugify_into(text: &[u8], out: &mut Vec<u8>) {
     while i < text.len() && out.len() - base <= SLUG_MAX {
         let c = text[i];
         if c < 0x80 {
-            let keep = if c >= b'A' && c <= b'Z' {
-                Some(c + 32)
-            } else if (c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9') {
-                Some(c)
-            } else {
-                None
-            };
-            if let Some(ch) = keep {
+            let mapped = ASCII_SLUG[c as usize];
+            if mapped != 0 {
                 if gap {
                     out.push(b'-');
                 }
                 gap = false;
-                out.push(ch);
+                out.push(mapped);
             } else {
                 gap = out.len() > base;
             }
@@ -350,6 +314,7 @@ pub fn slugify_vec(text: &[u8]) -> Vec<u8> {
 }
 
 /// Format `"YYYY-MM-DD"` as `"D Month YYYY"`.
+#[inline]
 pub fn long_date_into(date: &[u8], out: &mut Vec<u8>) {
     if date.len() < 10 {
         return;
@@ -358,14 +323,15 @@ pub fn long_date_into(date: &[u8], out: &mut Vec<u8>) {
     let d = (date[8] - b'0') * 10 + (date[9] - b'0');
     push_usize(d as usize, out);
     out.push(b' ');
-    if m >= 1 && m <= 12 {
+    if (1..=12).contains(&m) {
         out.extend_from_slice(MONTHS[(m - 1) as usize]);
     }
     out.push(b' ');
     out.extend_from_slice(&date[0..4]);
 }
 
-pub fn push_usize(mut n: usize, out: &mut Vec<u8>) {
+#[inline]
+pub fn push_usize<S: ByteSink>(mut n: usize, out: &mut S) {
     let mut buf = [0u8; 20];
     let mut idx = 20;
     if n == 0 {
@@ -377,5 +343,5 @@ pub fn push_usize(mut n: usize, out: &mut Vec<u8>) {
         buf[idx] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    out.extend_from_slice(&buf[idx..]);
+    out.write_slice(&buf[idx..]);
 }
